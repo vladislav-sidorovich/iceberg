@@ -129,8 +129,8 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     SnapshotDeltaLakeTable.Result result = conversionAction.execute();
 
     // Assert
-    checkSnapshotIntegrity(sourceTableLocation, sourceTable, newTableIdentifier, result);
-    checkTagContentAndOrder(sourceTableLocation, newTableIdentifier, 0);
+    checkLatestSnapshotIntegrity(sourceTable, newTableIdentifier);
+    checkTagContentAndOrder(sourceTable, sourceTableLocation, newTableIdentifier, 0);
     checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
   }
 
@@ -154,8 +154,8 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     SnapshotDeltaLakeTable.Result result = conversionAction.execute();
 
     // Assert
-    checkSnapshotIntegrity(sourceTableLocation, sourceTable, newTableIdentifier, result);
-    checkTagContentAndOrder(sourceTableLocation, newTableIdentifier, 0);
+    checkLatestSnapshotIntegrity(sourceTable, newTableIdentifier);
+    checkTagContentAndOrder(sourceTable, sourceTableLocation, newTableIdentifier, 0);
     checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
   }
 
@@ -184,6 +184,7 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
         "INSERT INTO " + sourceTable + " VALUES (12, current_date(), 'after_vacuum', null, null);");
     spark.sql("UPDATE " + sourceTable + " SET id=13 WHERE id=5;");
 
+    // Checkpoint generated. Simulate logs clean-up
     assertThat(deleteDeltaLogFile("00000000000000000000.json")).isTrue();
     assertThat(deleteDeltaLogFile("00000000000000000001.json")).isTrue();
     assertThat(deleteDeltaLogFile("00000000000000000002.json")).isTrue();
@@ -197,28 +198,30 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     SnapshotDeltaLakeTable.Result result = conversionAction.execute();
 
     // Assert
-    checkSnapshotIntegrity(sourceTableLocation, sourceTable, newTableIdentifier, result);
-    checkTagContentAndOrder(sourceTableLocation, newTableIdentifier, 10);
+    checkLatestSnapshotIntegrity(sourceTable, newTableIdentifier);
+    checkTagContentAndOrder(sourceTable, sourceTableLocation, newTableIdentifier, 10);
     checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
   }
 
-  private void checkSnapshotIntegrity(
-      String deltaTableLocation,
-      String deltaTableIdentifier,
-      String icebergTableIdentifier,
-      SnapshotDeltaLakeTable.Result snapshotReport) {
+  private void checkLatestSnapshotIntegrity(
+      String deltaTableIdentifier, String icebergTableIdentifier) {
+    checkSnapshotIntegrityForQuery(
+        "SELECT * FROM " + deltaTableIdentifier, "SELECT * FROM " + icebergTableIdentifier);
+  }
 
-    List<Row> deltaTableContents =
-        spark.sql("SELECT * FROM " + deltaTableIdentifier).collectAsList();
-    List<Row> icebergTableContents =
-        spark.sql("SELECT * FROM " + icebergTableIdentifier).collectAsList();
+  private void checkSnapshotIntegrityForQuery(String deltaSql, String icebergSql) {
+    List<Row> deltaTableContents = spark.sql(deltaSql).collectAsList();
+    List<Row> icebergTableContents = spark.sql(icebergSql).collectAsList();
 
     assertThat(deltaTableContents).hasSize(icebergTableContents.size());
     assertThat(icebergTableContents).containsExactlyInAnyOrderElementsOf(deltaTableContents);
   }
 
   private void checkTagContentAndOrder(
-      String deltaTableLocation, String icebergTableIdentifier, long firstConstructableVersion) {
+      String deltaTableIdentifier,
+      String deltaTableLocation,
+      String icebergTableIdentifier,
+      long firstConstructableVersion) {
     DefaultEngine deltaEngine = DefaultEngine.create(spark.sessionState().newHadoopConf());
     io.delta.kernel.Table deltaTable =
         io.delta.kernel.Table.forPath(deltaEngine, deltaTableLocation);
@@ -249,6 +252,13 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
       assertThat(icebergSnapshotRefs.get(expectedTimestampTag).isTag()).isTrue();
       assertThat(icebergSnapshotRefs.get(expectedTimestampTag).snapshotId())
           .isEqualTo(currentIcebergSnapshot.snapshotId());
+      checkSnapshotIntegrityForQuery(
+          "SELECT * FROM " + deltaTableIdentifier + " VERSION AS OF " + deltaVersion,
+          "SELECT * FROM "
+              + icebergTableIdentifier
+              + " VERSION AS OF '"
+              + expectedVersionTag
+              + "'");
     }
   }
 
@@ -260,7 +270,8 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
             .format("delta")
             .mode(SaveMode.Append)
             .option("path", path)
-            .option("delta.enableInCommitTimestamps", "true");
+            .option("delta.enableInCommitTimestamps", "true")
+            .option("delta.enableRowTracking", "true"); // Increase delta writer version to 7
 
     if (partitionColumns.length > 0) {
       delta = delta.partitionBy(partitionColumns);
