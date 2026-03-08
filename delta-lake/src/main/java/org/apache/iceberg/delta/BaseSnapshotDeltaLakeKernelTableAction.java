@@ -18,9 +18,11 @@
  */
 package org.apache.iceberg.delta;
 
+import io.delta.kernel.Scan;
 import io.delta.kernel.Snapshot;
 import io.delta.kernel.Table;
 import io.delta.kernel.data.ColumnarBatch;
+import io.delta.kernel.data.FilteredColumnarBatch;
 import io.delta.kernel.data.Row;
 import io.delta.kernel.defaults.engine.DefaultEngine;
 import io.delta.kernel.engine.Engine;
@@ -74,6 +76,7 @@ import org.apache.iceberg.parquet.ParquetUtil;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -156,17 +159,15 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     assertDeltaDeletionVectorsDisabled(
         "Conversion of Delta Lake tables with deletionVectors feature is not supported yet.");
 
-    long latestDeltaVersion = getLatestDeltaSnapshot().getVersion();
-    long initialDeltaVersion = getEarliestDeltaLog();
+    final long latestDeltaVersion = getLatestDeltaSnapshot().getVersion();
+    final long minimalAvailableDeltaVersion = getEarliestRecreatableDeltaLog();
 
-    // the initialDeltaVersion used as a lower bound and the actual snapshot can be at bigger
-    // version because of possible concurrent operations. It's ok.
-    SnapshotImpl initialDeltaSnapshot = getDeltaSnapshotAsOfVersion(initialDeltaVersion);
+    SnapshotImpl initialDeltaSnapshot = getDeltaSnapshotAsOfVersion(minimalAvailableDeltaVersion);
 
     LOG.info(
         "Converting Delta Lake table at {} from version {} to version {} into Iceberg table {} ...",
         deltaTableLocation,
-        initialDeltaVersion,
+        minimalAvailableDeltaVersion,
         latestDeltaVersion,
         newTableIdentifier);
 
@@ -183,10 +184,12 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
             buildTablePropertiesWithDelta(initialDeltaSnapshot, deltaTableLocation));
     setDefaultNamingMapping(transaction);
 
-    long totalDataFiles;
+    Set<String> processedDataFiles = Sets.newHashSet();
     try {
-      totalDataFiles =
-          convertEachDeltaVersion(initialDeltaVersion, latestDeltaVersion, transaction);
+      commitDeltaSnapshotToIcebergTransaction(
+          initialDeltaSnapshot, transaction, processedDataFiles);
+      convertEachDeltaVersion(
+          minimalAvailableDeltaVersion + 1, latestDeltaVersion, transaction, processedDataFiles);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -194,11 +197,26 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     transaction.commitTransaction();
 
     LOG.info(
-        "Successfully created Iceberg table {} from Delta Lake table at {}, total data file count: {}",
+        "Successfully created Iceberg table {} from Delta Lake table at {}, processed data file count: {}",
         newTableIdentifier,
         deltaTableLocation,
-        totalDataFiles);
-    return () -> totalDataFiles;
+        processedDataFiles.size());
+    return processedDataFiles::size;
+  }
+
+  private void commitDeltaSnapshotToIcebergTransaction(
+      SnapshotImpl deltaSnapshot, Transaction transaction, Set<String> processedDataFiles)
+      throws IOException {
+    Scan scan = deltaSnapshot.getScanBuilder().build();
+    try (CloseableIterator<FilteredColumnarBatch> changes = scan.getScanFiles(deltaEngine)) {
+      while (changes.hasNext()) {
+        FilteredColumnarBatch columnarBatch = changes.next();
+        commitDeltaColumnarBatchToIcebergTransaction(
+            columnarBatch.getData(), transaction, processedDataFiles);
+      }
+      tagCurrentSnapshot(
+          deltaSnapshot.getVersion(), deltaSnapshot.getTimestamp(deltaEngine), transaction);
+    }
   }
 
   /**
@@ -239,11 +257,13 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     return (SnapshotImpl) snapshot;
   }
 
-  private long convertEachDeltaVersion(
-      long initialDeltaVersion, long latestDeltaVersion, Transaction transaction)
+  private void convertEachDeltaVersion(
+      long initialDeltaVersion,
+      long latestDeltaVersion,
+      Transaction transaction,
+      Set<String> processedDataFiles)
       throws IOException {
 
-    long dataFiles = 0;
     for (long currDeltaVersion = initialDeltaVersion;
         currDeltaVersion <= latestDeltaVersion;
         currDeltaVersion++) {
@@ -256,13 +276,13 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
         while (changes.hasNext()) {
           ColumnarBatch columnarBatch = changes.next();
 
-          dataFiles +=
+          Long commitTimestamp =
               commitDeltaColumnarBatchToIcebergTransaction(
-                  currDeltaVersion, columnarBatch, transaction);
+                  columnarBatch, transaction, processedDataFiles);
+          tagCurrentSnapshot(currDeltaVersion, commitTimestamp, transaction);
         }
       }
     }
-    return dataFiles;
   }
 
   /**
@@ -275,8 +295,9 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
    *
    * @return number of added data files
    */
-  private long commitDeltaColumnarBatchToIcebergTransaction(
-      long deltaVersion, ColumnarBatch columnarBatch, Transaction transaction) throws IOException {
+  private Long commitDeltaColumnarBatchToIcebergTransaction(
+      ColumnarBatch columnarBatch, Transaction transaction, Set<String> processedDataFiles)
+      throws IOException {
     // TODO
     // 1. initial delta version with all the data files
     // 1.1 data skipping stats
@@ -301,21 +322,21 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
 
           DataFile dataFile = buildDataFileFromAddDeltaAction(addFile, transaction);
           dataFilesToAdd.add(dataFile);
+          processedDataFiles.add(dataFile.location());
         } else if (DeltaLakeActionsTranslationUtil.isRemove(row)) {
           RemoveFile remove = DeltaLakeActionsTranslationUtil.toRemove(row);
 
           DataFile dataFile = buildDataFileFromRemoveDeltaAction(remove, transaction);
           dataFilesToRemove.add(dataFile);
+          processedDataFiles.add(dataFile.location());
         }
       }
     }
 
     // TODO support more actions
     dataFilesToIcebergTransaction(transaction, dataFilesToAdd, dataFilesToRemove);
-    tagCurrentSnapshot(deltaVersion, commitTimestamp, transaction);
 
-    // TODO fix number. Removed files not counted
-    return dataFilesToAdd.size();
+    return commitTimestamp;
   }
 
   /**
@@ -426,10 +447,10 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     return new Schema(converted.asNestedType().asStructType().fields());
   }
 
-  private long getEarliestDeltaLog() {
+  private long getEarliestRecreatableDeltaLog() {
     try {
       // "_delta_log" is unmodifiable logs location
-      return DeltaHistoryManager.getEarliestDeltaFile(
+      return DeltaHistoryManager.getEarliestRecreatableCommit(
           deltaEngine, new Path(deltaTableLocation, "_delta_log"));
     } catch (TableNotFoundException e) {
       throw deltaTableNotFoundException(e);

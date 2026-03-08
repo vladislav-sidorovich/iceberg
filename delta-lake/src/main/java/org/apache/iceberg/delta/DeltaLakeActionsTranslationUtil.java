@@ -30,7 +30,7 @@ class DeltaLakeActionsTranslationUtil {
   private DeltaLakeActionsTranslationUtil() {}
 
   public static boolean isAdd(Row row) {
-    return !row.isNullAt(getOrdinal(row, "add"));
+    return isNotNullAt(row, "add");
   }
 
   public static AddFile toAdd(Row row) {
@@ -38,7 +38,7 @@ class DeltaLakeActionsTranslationUtil {
   }
 
   public static boolean isRemove(Row row) {
-    return !row.isNullAt(getOrdinal(row, "remove"));
+    return isNotNullAt(row, "remove");
   }
 
   public static RemoveFile toRemove(Row row) {
@@ -46,23 +46,28 @@ class DeltaLakeActionsTranslationUtil {
   }
 
   public static boolean isMetaData(Row row) {
-    return !row.isNullAt(getOrdinal(row, "metaData"));
+    return isNotNullAt(row, "metaData");
   }
 
   public static boolean isTxn(Row row) {
-    return !row.isNullAt(getOrdinal(row, "txn"));
+    return isNotNullAt(row, "txn");
   }
 
   public static boolean isProtocol(Row row) {
-    return !row.isNullAt(getOrdinal(row, "protocol"));
+    return isNotNullAt(row, "protocol");
   }
 
   public static boolean isCdc(Row row) {
-    return !row.isNullAt(getOrdinal(row, "cdc"));
+    return isNotNullAt(row, "cdc");
   }
 
   public static boolean isCommitInfo(Row row) {
-    return !row.isNullAt(getOrdinal(row, "commitInfo"));
+    return isNotNullAt(row, "commitInfo");
+  }
+
+  private static boolean isNotNullAt(Row row, String fieldName) {
+    int position = getOrdinal(row, fieldName);
+    return position >= 0 && !row.isNullAt(position);
   }
 
   private static int getOrdinal(Row row, String filedName) {

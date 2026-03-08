@@ -18,15 +18,18 @@
  */
 package org.apache.iceberg.delta;
 
-import static org.apache.spark.sql.functions.current_date;
-import static org.apache.spark.sql.functions.date_add;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.delta.standalone.DeltaLog;
+import io.delta.kernel.defaults.engine.DefaultEngine;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.sql.Timestamp;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Table;
@@ -36,11 +39,17 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.iceberg.util.LocationUtil;
+import org.apache.spark.sql.DataFrameWriter;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.connector.catalog.CatalogPlugin;
 import org.apache.spark.sql.delta.catalog.DeltaCatalog;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Metadata;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -62,6 +71,8 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
           "false" // Spark will delete tables using v1, leaving the cache out of sync
           );
 
+  private static Dataset<Row> genericDataFrame;
+
   @TempDir private File sourceLocation;
   @TempDir private File destinationLocation;
 
@@ -73,6 +84,25 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
   @BeforeAll
   public static void beforeClass() {
     spark.sql(String.format("CREATE DATABASE IF NOT EXISTS %s", NAMESPACE));
+    StructType schema =
+        new StructType(
+            new StructField[] {
+              new StructField("id", DataTypes.IntegerType, false, Metadata.empty()),
+              new StructField("created_at", DataTypes.TimestampType, true, Metadata.empty()),
+              new StructField("event_name", DataTypes.StringType, true, Metadata.empty()),
+              new StructField("is_active", DataTypes.BooleanType, true, Metadata.empty()),
+              new StructField("price", DataTypes.DoubleType, true, Metadata.empty())
+            });
+    List<Row> data =
+        Arrays.asList(
+            RowFactory.create(1, Timestamp.valueOf("2025-01-01 10:00:00"), "Signup", true, 0.00),
+            RowFactory.create(
+                2, Timestamp.valueOf("2025-01-02 14:30:00"), "Purchase", true, 199.99),
+            RowFactory.create(
+                3, Timestamp.valueOf("2025-01-03 09:15:00"), "Deactivation", false, 0.00),
+            RowFactory.create(4, Timestamp.valueOf("2025-01-03 09:16:00"), "Refund", false, 0.00),
+            RowFactory.create(5, Timestamp.valueOf("2025-01-03 09:17:00"), "Refund", false, 0.00));
+    genericDataFrame = spark.createDataFrame(data, schema);
   }
 
   @AfterAll
@@ -84,13 +114,11 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
   public void testBasicPartitionedInsertsOnly() {
     String sourceTable = toFullTableName(DEFAULT_SPARK_CATALOG, "partitioned_table");
     String sourceTableLocation = sourceLocation.toURI().toString();
-    System.out.println("temp dir is: " + sourceTableLocation);
 
-    Dataset<Row> df = spark.range(0, 5, 1, 5).withColumn("dateCol", date_add(current_date(), 1));
-    writeDeltaTable(df, sourceTable, sourceTableLocation, "id");
-    spark.sql("INSERT INTO " + sourceTable + " VALUES (10, current_date());");
-    spark.sql("INSERT INTO " + sourceTable + " VALUES (11, current_date());");
-    spark.sql("INSERT INTO " + sourceTable + " VALUES (12, current_date());");
+    writeDeltaTable(genericDataFrame, sourceTable, sourceTableLocation, "id");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (10, current_date(), null, null, null);");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (11, current_date(), null, null, null);");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (12, current_date(), null, null, null);");
 
     String newTableIdentifier = toFullTableName(ICEBERG_CATALOG_NAME, "iceberg_partitioned_table");
 
@@ -111,12 +139,11 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     String sourceTable = toFullTableName(DEFAULT_SPARK_CATALOG, "crud_table");
     String sourceTableLocation = sourceLocation.toURI().toString();
 
-    Dataset<Row> df = spark.range(0, 5, 1, 5).withColumn("dateCol", date_add(current_date(), 1));
-    writeDeltaTable(df, sourceTable, sourceTableLocation, "id");
-    spark.sql("INSERT INTO " + sourceTable + " VALUES (10, current_date());");
+    writeDeltaTable(genericDataFrame, sourceTable, sourceTableLocation, "id");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (10, current_date(), null, null, null);");
     spark.sql("DELETE FROM " + sourceTable + " WHERE id=3;");
     spark.sql("UPDATE " + sourceTable + " SET id=3 WHERE id=1;");
-    spark.sql("INSERT INTO " + sourceTable + " VALUES (11, current_date());");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (11, current_date(), null, null, null);");
 
     String newTableIdentifier = toFullTableName(ICEBERG_CATALOG_NAME, "iceberg_crud_table");
 
@@ -129,6 +156,49 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     // Assert
     checkSnapshotIntegrity(sourceTableLocation, sourceTable, newTableIdentifier, result);
     checkTagContentAndOrder(sourceTableLocation, newTableIdentifier, 0);
+    checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
+  }
+
+  @Test
+  public void testConversionAfterVacuum() throws IOException {
+    String sourceTable = toFullTableName(DEFAULT_SPARK_CATALOG, "vacuumed_table");
+    String sourceTableLocation = sourceLocation.toURI().toString();
+
+    writeDeltaTable(genericDataFrame, sourceTable, sourceTableLocation, "id");
+    for (int i = 0; i < 5; i++) {
+      spark.sql(
+          "UPDATE "
+              + sourceTable
+              + " SET price="
+              + ThreadLocalRandom.current().nextDouble(1000)
+              + " where id="
+              + i
+              + ";");
+    }
+    spark.sql("UPDATE " + sourceTable + " SET created_at=current_date() ;");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (10, current_date(), null, null, null);");
+    spark.sql("INSERT INTO " + sourceTable + " VALUES (11, current_date(), null, null, null);");
+    spark.sql("DELETE FROM " + sourceTable + " WHERE id>=10;");
+    spark.sql("VACUUM " + sourceTable + " RETAIN 0 HOURS");
+    spark.sql(
+        "INSERT INTO " + sourceTable + " VALUES (12, current_date(), 'after_vacuum', null, null);");
+    spark.sql("UPDATE " + sourceTable + " SET id=13 WHERE id=5;");
+
+    assertThat(deleteDeltaLogFile("00000000000000000000.json")).isTrue();
+    assertThat(deleteDeltaLogFile("00000000000000000001.json")).isTrue();
+    assertThat(deleteDeltaLogFile("00000000000000000002.json")).isTrue();
+
+    String newTableIdentifier = toFullTableName(ICEBERG_CATALOG_NAME, "iceberg_vacuumed_table");
+
+    // Act
+    SnapshotDeltaLakeTable conversionAction =
+        DeltaLakeToIcebergMigrationSparkIntegration.snapshotDeltaLakeKernelTable(
+            spark, newTableIdentifier, sourceTableLocation);
+    SnapshotDeltaLakeTable.Result result = conversionAction.execute();
+
+    // Assert
+    checkSnapshotIntegrity(sourceTableLocation, sourceTable, newTableIdentifier, result);
+    checkTagContentAndOrder(sourceTableLocation, newTableIdentifier, 10);
     checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
   }
 
@@ -149,8 +219,11 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
 
   private void checkTagContentAndOrder(
       String deltaTableLocation, String icebergTableIdentifier, long firstConstructableVersion) {
-    DeltaLog deltaLog = DeltaLog.forTable(spark.sessionState().newHadoopConf(), deltaTableLocation);
-    long currentVersion = deltaLog.snapshot().getVersion();
+    DefaultEngine deltaEngine = DefaultEngine.create(spark.sessionState().newHadoopConf());
+    io.delta.kernel.Table deltaTable =
+        io.delta.kernel.Table.forPath(deltaEngine, deltaTableLocation);
+    io.delta.kernel.Snapshot latestSnapshot = deltaTable.getLatestSnapshot(deltaEngine);
+    long currentVersion = latestSnapshot.getVersion();
     Table icebergTable = getIcebergTable(icebergTableIdentifier);
     Map<String, SnapshotRef> icebergSnapshotRefs = icebergTable.refs();
     List<Snapshot> icebergSnapshots = Lists.newArrayList(icebergTable.snapshots());
@@ -168,9 +241,9 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
       assertThat(icebergSnapshotRefs.get(expectedVersionTag).snapshotId())
           .isEqualTo(currentIcebergSnapshot.snapshotId());
 
-      Timestamp deltaVersionTimestamp = deltaLog.getCommitInfoAt(deltaVersion).getTimestamp();
-      assertThat(deltaVersionTimestamp).isNotNull();
-      String expectedTimestampTag = "delta-ts-" + deltaVersionTimestamp.getTime();
+      long deltaVersionTs =
+          deltaTable.getSnapshotAsOfVersion(deltaEngine, deltaVersion).getTimestamp(deltaEngine);
+      String expectedTimestampTag = "delta-ts-" + deltaVersionTs;
 
       assertThat(icebergSnapshotRefs.get(expectedTimestampTag)).isNotNull();
       assertThat(icebergSnapshotRefs.get(expectedTimestampTag).isTag()).isTrue();
@@ -182,16 +255,17 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
   private void writeDeltaTable(
       Dataset<Row> df, String identifier, String path, String... partitionColumns) {
     spark.sql(String.format("DROP TABLE IF EXISTS %s", identifier));
+    DataFrameWriter<Row> delta =
+        df.write()
+            .format("delta")
+            .mode(SaveMode.Append)
+            .option("path", path)
+            .option("delta.enableInCommitTimestamps", "true");
+
     if (partitionColumns.length > 0) {
-      df.write()
-          .format("delta")
-          .mode(SaveMode.Append)
-          .option("path", path)
-          .partitionBy(partitionColumns)
-          .saveAsTable(identifier);
-    } else {
-      df.write().format("delta").mode(SaveMode.Append).option("path", path).saveAsTable(identifier);
+      delta = delta.partitionBy(partitionColumns);
     }
+    delta.saveAsTable(identifier);
   }
 
   private String toFullTableName(String catalogName, String dest) {
@@ -199,6 +273,11 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
       return NAMESPACE + "." + catalogName + "_" + dest;
     }
     return catalogName + "." + NAMESPACE + "." + catalogName + "_" + dest;
+  }
+
+  private boolean deleteDeltaLogFile(String logName) throws IOException {
+    String tablePath = sourceLocation.toPath().toString();
+    return Files.deleteIfExists(Paths.get(tablePath, "/_delta_log/", logName));
   }
 
   private void checkIcebergTableLocation(String icebergTableIdentifier, String expectedLocation) {
