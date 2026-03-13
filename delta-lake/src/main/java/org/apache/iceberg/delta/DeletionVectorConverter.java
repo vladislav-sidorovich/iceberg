@@ -27,18 +27,19 @@ import io.delta.kernel.internal.deletionvectors.DeletionVectorUtils;
 import io.delta.kernel.internal.deletionvectors.RoaringBitmapArray;
 import io.delta.kernel.internal.util.Tuple2;
 
-public class DeletionVectorConversionUtil {
-    private final Engine engine;,
+public class DeletionVectorConverter {
+    private final Engine engine;
     private final String tablePath;
 
-    public DeletionVectorConversionUtil(Engine engine, String tablePath) {
+    public DeletionVectorConverter(Engine engine, String tablePath) {
         this.engine = engine;
         this.tablePath = tablePath;
     }
 
-    public void convertToIcebergDV(DeletionVectorDescriptor descriptor) {
+    public long[] readPositions(DeletionVectorDescriptor descriptor) {
         Tuple2<DeletionVectorDescriptor, RoaringBitmapArray> tuple =
                 DeletionVectorUtils.loadNewDvAndBitmap(engine, tablePath, descriptor);
-        System.out.println(tuple);
+
+        return tuple._2.toArray();
     }
 }

@@ -32,6 +32,7 @@ import io.delta.kernel.internal.DeltaLogActionUtils;
 import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.TableImpl;
 import io.delta.kernel.internal.actions.AddFile;
+import io.delta.kernel.internal.actions.DeletionVectorDescriptor;
 import io.delta.kernel.internal.actions.RemoveFile;
 import io.delta.kernel.internal.fs.Path;
 import io.delta.kernel.internal.util.VectorUtils;
@@ -53,6 +54,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DeleteFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.ManageSnapshots;
@@ -61,23 +63,34 @@ import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.OverwriteFiles;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.deletes.PositionDelete;
+import org.apache.iceberg.deletes.PositionDeleteWriter;
+import org.apache.iceberg.deletes.SortingPositionOnlyDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.io.FileWriterFactory;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
+import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.parquet.ParquetUtil;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
+import org.apache.iceberg.util.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -102,6 +115,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   private TableIdentifier newTableIdentifier;
   private String newTableLocation;
   private HadoopFileIO deltaLakeFileIO;
+  private DeletionVectorConverter deletionVectorConverter;
 
   BaseSnapshotDeltaLakeKernelTableAction(String deltaTableLocation) {
     this.deltaTableLocation = deltaTableLocation;
@@ -143,6 +157,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     deltaEngine = DefaultEngine.create(conf);
     deltaLakeFileIO = new HadoopFileIO(conf);
     deltaTable = (TableImpl) Table.forPath(deltaEngine, deltaTableLocation);
+    deletionVectorConverter = new DeletionVectorConverter(deltaEngine, deltaTableLocation);
     return this;
   }
 
@@ -156,8 +171,8 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
         "Make sure to configure the action with a valid deltaLakeConfiguration");
     assertDeltaColumnMappingDisabled(
         "Conversion of Delta Lake tables with columnMapping feature is not supported.");
-    assertDeltaDeletionVectorsDisabled(
-        "Conversion of Delta Lake tables with deletionVectors feature is not supported yet.");
+//    assertDeltaDeletionVectorsDisabled(
+//        "Conversion of Delta Lake tables with deletionVectors feature is not supported yet.");
 
     final long latestDeltaVersion = getLatestDeltaSnapshot().getVersion();
     final long minimalAvailableDeltaVersion = getEarliestRecreatableDeltaLog();
@@ -233,13 +248,13 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   }
 
   /** Current conversion implementation doesn't support DV conversion yet. */
-  private void assertDeltaDeletionVectorsDisabled(String errorMessage) {
-    Map<String, String> configuration = getLatestDeltaSnapshot().getMetadata().getConfiguration();
-    String columnMappingMode = configuration.getOrDefault("delta.enableDeletionVectors", "false");
-    if ("true".equals(columnMappingMode)) {
-      throw new UnsupportedOperationException(errorMessage);
-    }
-  }
+//  private void assertDeltaDeletionVectorsDisabled(String errorMessage) {
+//    Map<String, String> configuration = getLatestDeltaSnapshot().getMetadata().getConfiguration();
+//    String columnMappingMode = configuration.getOrDefault("delta.enableDeletionVectors", "false");
+//    if ("true".equals(columnMappingMode)) {
+//      throw new UnsupportedOperationException(errorMessage);
+//    }
+//  }
 
   private static void setDefaultNamingMapping(Transaction transaction) {
     transaction
@@ -322,6 +337,31 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
 
           DataFile dataFile = buildDataFileFromAddDeltaAction(addFile, transaction);
           dataFilesToAdd.add(dataFile);
+
+          Optional<DeletionVectorDescriptor> deletionVector = addFile.getDeletionVector();
+          if (deletionVector.isPresent()) {
+            long[] positions = deletionVectorConverter.readPositions(deletionVector.get());
+//            RowDelta rowDelta = transaction.newRowDelta().addDeletes().commit();
+//            SortingPositionOnlyDeleteWriter.writeDeletes
+            PositionDelete<Record> positionDelete = PositionDelete.create();
+//            DeleteFile deleteFile =
+//                    writePositionDeletes(
+//                            writerFactory,
+//                            ImmutableList.of(
+//                                    Pair.of(dataFile1.location(), 0L),
+//                                    Pair.of(dataFile1.location(), 1L),
+//                                    Pair.of(dataFile2.location(), 0L)));
+//            table.newRowDelta().addDeletes(deleteFile).commit();
+
+//            try {
+              for (long deletedRowIndex : positions) {
+                positionDelete.set(dataFile.location(), deletedRowIndex);
+              }
+            System.out.println(positionDelete);
+//              writer.write(positionDelete);
+//            }
+          }
+
           processedDataFiles.add(dataFile.location());
         } else if (DeltaLakeActionsTranslationUtil.isRemove(row)) {
           RemoveFile remove = DeltaLakeActionsTranslationUtil.toRemove(row);
@@ -338,6 +378,21 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
 
     return commitTimestamp;
   }
+
+//  private DeleteFile writePositionDeletes(
+//          FileWriterFactory<T> writerFactory, List<Pair<String, Long>> deletes) throws IOException {
+//    EncryptedOutputFile file = parquetFileFactory.newOutputFile(table.spec(), null);
+//    try (PositionDeleteWriter<T> writer =
+//                 writerFactory.newPositionDeleteWriter(file, table.spec(), null)) {
+//      PositionDelete<T> posDelete = PositionDelete.create();
+//
+//      for (Pair<String, Long> delete : deletes) {
+//        writer.write(posDelete.set(delete.first(), delete.second()));
+//      }
+//
+//      return writer.toDeleteFile();
+//    }
+//  }
 
   /**
    * CASES: 1. Append only 2. Delete only 3. Append and Delete => overwrite 4. No Append, No Delete

@@ -194,7 +194,7 @@ public class TestBaseSnapshotDeltaLakeKernelTableAction {
 
   @Test
   public void testTableCreated() throws Exception {
-    loadDeltaLakeGoldenTable("basic-decimal-table");
+    loadDeltaLakeGoldenTable("dv-partitioned-with-checkpoint");
 
     TableIdentifier icebergTable = TableIdentifier.of("iceberg_table");
     SnapshotDeltaLakeTable testAction =

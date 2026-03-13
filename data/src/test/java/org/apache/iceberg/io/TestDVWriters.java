@@ -336,17 +336,14 @@ public abstract class TestDVWriters<T> extends WriterTestBase<T> {
   private DeleteFile writePositionDeletes(
       FileWriterFactory<T> writerFactory, List<Pair<String, Long>> deletes) throws IOException {
     EncryptedOutputFile file = parquetFileFactory.newOutputFile(table.spec(), null);
-    PositionDeleteWriter<T> writer =
-        writerFactory.newPositionDeleteWriter(file, table.spec(), null);
-    PositionDelete<T> posDelete = PositionDelete.create();
-
-    try (PositionDeleteWriter<T> closableWriter = writer) {
+    try (PositionDeleteWriter<T> closableWriter = writerFactory.newPositionDeleteWriter(file, table.spec(), null)) {
+      PositionDelete<T> posDelete = PositionDelete.create();
       for (Pair<String, Long> delete : deletes) {
         closableWriter.write(posDelete.set(delete.first(), delete.second()));
       }
-    }
 
-    return writer.toDeleteFile();
+      return closableWriter.toDeleteFile();
+    }
   }
 
   private static class PreviousDeleteLoader implements Function<String, PositionDeleteIndex> {
