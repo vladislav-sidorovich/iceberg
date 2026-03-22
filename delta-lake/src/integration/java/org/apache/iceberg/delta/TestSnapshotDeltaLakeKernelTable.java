@@ -203,6 +203,49 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
   }
 
+  @Test
+  public void testConversionWithDeletionVectors() {
+    String sourceTable = toFullTableName(DEFAULT_SPARK_CATALOG, "dv_table");
+    String sourceTableLocation = sourceLocation.toURI().toString();
+
+    spark.sql(String.format("DROP TABLE IF EXISTS %s", sourceTable));
+
+    // 10k records to force usage of DVs in Update operation
+    Dataset<Row> dvDf =
+        spark
+            .range(10000)
+            .selectExpr(
+                "CAST(id AS int) AS id",
+                "current_timestamp() AS created_at",
+                "CAST(id AS string) AS event_name",
+                "CAST(id % 2 == 0 AS boolean) AS is_active",
+                "CAST(id AS double) AS price");
+
+    dvDf.write()
+        .format("delta")
+        .mode(SaveMode.Append)
+        .option("path", sourceTableLocation)
+        .option("delta.enableDeletionVectors", "true")
+        .option("delta.enableInCommitTimestamps", "true")
+        .option("delta.enableRowTracking", "true")
+        .saveAsTable(sourceTable);
+
+    spark.sql("UPDATE " + sourceTable + " SET id=-1 WHERE id=1 OR id=2;");
+
+    String newTableIdentifier = toFullTableName(ICEBERG_CATALOG_NAME, "iceberg_dv_table");
+
+    // Act
+    SnapshotDeltaLakeTable conversionAction =
+        DeltaLakeToIcebergMigrationSparkIntegration.snapshotDeltaLakeKernelTable(
+            spark, newTableIdentifier, sourceTableLocation);
+    conversionAction.execute();
+
+    // Assert
+    checkLatestSnapshotIntegrity(sourceTable, newTableIdentifier);
+    checkTagContentAndOrder(sourceTable, sourceTableLocation, newTableIdentifier, 0);
+    checkIcebergTableLocation(newTableIdentifier, sourceTableLocation);
+  }
+
   private void checkLatestSnapshotIntegrity(
       String deltaTableIdentifier, String icebergTableIdentifier) {
     checkSnapshotIntegrityForQuery(

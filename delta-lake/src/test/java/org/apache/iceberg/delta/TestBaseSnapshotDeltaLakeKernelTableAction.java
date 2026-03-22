@@ -47,6 +47,7 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Catalog;
@@ -54,6 +55,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.ContentFileUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -148,29 +150,6 @@ public class TestBaseSnapshotDeltaLakeKernelTableAction {
   }
 
   @Test
-  public void testDeltaTableDVDisabled() throws Exception {
-    Engine engine = DefaultEngine.create(testHadoopConf);
-    Transaction txn =
-        createEmptyDeltaTableTransaction(engine)
-            .withTableProperties(engine, Map.of("delta.enableDeletionVectors", "true"))
-            .build(engine);
-    txn.commit(engine, CloseableIterable.emptyIterable());
-
-    SnapshotDeltaLakeTable testAction =
-        new BaseSnapshotDeltaLakeKernelTableAction(sourceTableLocation)
-            .as(TableIdentifier.of("iceberg_table"))
-            .deltaLakeConfiguration(testHadoopConf)
-            .icebergCatalog(testCatalog)
-            .tableLocation(newTableLocation);
-
-    // Act & check
-    assertThatThrownBy(testAction::execute)
-        .isInstanceOf(UnsupportedOperationException.class)
-        .hasMessage(
-            "Conversion of Delta Lake tables with deletionVectors feature is not supported yet.");
-  }
-
-  @Test
   public void testEmptyTableConversion() {
     Engine engine = DefaultEngine.create(testHadoopConf);
     createEmptyDeltaTableTransaction(engine)
@@ -190,11 +169,14 @@ public class TestBaseSnapshotDeltaLakeKernelTableAction {
     testAction.execute();
 
     assertThat(testCatalog.tableExists(icebergTable)).isTrue();
+
+    org.apache.iceberg.Table table = testCatalog.loadTable(icebergTable);
+    assertThat(((BaseTable) table).operations().current().formatVersion()).isEqualTo(3);
   }
 
   @Test
   public void testTableCreated() throws Exception {
-    loadDeltaLakeGoldenTable("dv-partitioned-with-checkpoint");
+    loadDeltaLakeGoldenTable("basic-decimal-table");
 
     TableIdentifier icebergTable = TableIdentifier.of("iceberg_table");
     SnapshotDeltaLakeTable testAction =
@@ -279,6 +261,46 @@ public class TestBaseSnapshotDeltaLakeKernelTableAction {
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage(
             "Delta Lake table does not exist at the given location: %s", sourceTableLocation);
+  }
+
+  @Test
+  public void testDeltaTableDVSupported() throws Exception {
+    loadDeltaLakeGoldenTable("dv-partitioned-with-checkpoint");
+    Engine engine = DefaultEngine.create(testHadoopConf);
+    Table deltaTable = Table.forPath(engine, sourceTableLocation);
+
+    io.delta.kernel.internal.SnapshotImpl deltaSnapshot =
+        (io.delta.kernel.internal.SnapshotImpl) deltaTable.getLatestSnapshot(engine);
+    assertThat(
+            deltaSnapshot
+                .getMetadata()
+                .getConfiguration()
+                .getOrDefault("delta.enableDeletionVectors", "false"))
+        .isEqualTo("true");
+
+    TableIdentifier icebergTableIdentifier = TableIdentifier.of("iceberg_table");
+    SnapshotDeltaLakeTable testAction =
+        new BaseSnapshotDeltaLakeKernelTableAction(sourceTableLocation)
+            .as(icebergTableIdentifier)
+            .deltaLakeConfiguration(testHadoopConf)
+            .icebergCatalog(testCatalog)
+            .tableLocation(newTableLocation);
+
+    // Act
+    testAction.execute();
+
+    org.apache.iceberg.Table icebergTable = testCatalog.loadTable(icebergTableIdentifier);
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        icebergTable.newScan().planFiles()) {
+      boolean hasDeleteFiles = false;
+      for (org.apache.iceberg.FileScanTask task : tasks) {
+        for (org.apache.iceberg.DeleteFile deleteFile : task.deletes()) {
+          assertThat(ContentFileUtil.isDV(deleteFile)).isTrue();
+          hasDeleteFiles = true;
+        }
+      }
+      assertThat(hasDeleteFiles).isTrue();
+    }
   }
 
   static List<String> deltaGoldenTableNames() throws Exception {
