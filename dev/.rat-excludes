@@ -33,3 +33,4 @@ sitemap.xml
 derby.log
 .python-version
 .*_index.md
+.*/_delta_log/_last_checkpoint
