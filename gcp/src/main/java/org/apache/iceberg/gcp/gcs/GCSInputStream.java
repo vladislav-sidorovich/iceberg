@@ -126,13 +126,19 @@ class GCSInputStream extends SeekableInputStream implements RangeReadable {
     Preconditions.checkState(!closed, "Cannot read: already closed");
     singleByteBuffer.position(0);
 
-    pos += 1;
+    int bytesRead;
     try {
-      channel.read(singleByteBuffer);
+      bytesRead = channel.read(singleByteBuffer);
     } catch (IOException e) {
       GCSExceptionUtil.throwNotFoundIfNotPresent(e, blobId);
       throw e;
     }
+
+    if (bytesRead == -1) {
+      return -1;
+    }
+
+    pos += 1;
     readBytes.increment();
     readOperations.increment();
 
@@ -144,6 +150,10 @@ class GCSInputStream extends SeekableInputStream implements RangeReadable {
     Preconditions.checkState(!closed, "Cannot read: already closed");
     byteBuffer = byteBuffer != null && byteBuffer.array() == b ? byteBuffer : ByteBuffer.wrap(b);
     int bytesRead = read(channel, byteBuffer, off, len);
+    if (bytesRead == -1) {
+      return -1;
+    }
+
     pos += bytesRead;
     readBytes.increment(bytesRead);
     readOperations.increment();
