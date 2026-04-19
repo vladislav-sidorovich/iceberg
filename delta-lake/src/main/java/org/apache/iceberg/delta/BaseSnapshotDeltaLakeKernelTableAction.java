@@ -109,6 +109,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   private HadoopFileIO deltaLakeFileIO;
   private DeletionVectorConverter deletionVectorConverter;
   private OutputFileFactory icebergFileFactory;
+  private final Set<Long> deltaTimestampTags = Sets.newHashSet();
 
   BaseSnapshotDeltaLakeKernelTableAction(String deltaTableLocation) {
     this.deltaTableLocation = deltaTableLocation;
@@ -251,8 +252,8 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
         .commit();
   }
 
-  private SnapshotImpl getDeltaSnapshotAsOfVersion(long earliestDeltaFile) {
-    Snapshot snapshot = deltaTable.getSnapshotAsOfVersion(deltaEngine, earliestDeltaFile);
+  private SnapshotImpl getDeltaSnapshotAsOfVersion(long deltaVersion) {
+    Snapshot snapshot = deltaTable.getSnapshotAsOfVersion(deltaEngine, deltaVersion);
     assertSnapshotImpl(snapshot);
     return (SnapshotImpl) snapshot;
   }
@@ -273,14 +274,19 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
               currDeltaVersion,
               currDeltaVersion,
               Set.of(DeltaLogActionUtils.DeltaAction.values()))) {
+        Long batchTimestamp = null;
         while (changes.hasNext()) {
           ColumnarBatch columnarBatch = changes.next();
 
           Long commitTimestamp =
               commitDeltaColumnarBatchToIcebergTransaction(
                   columnarBatch, transaction, processedDataFiles);
-          tagCurrentSnapshot(currDeltaVersion, commitTimestamp, transaction);
+          if (batchTimestamp == null) {
+            batchTimestamp = commitTimestamp;
+          }
         }
+
+        tagCurrentSnapshot(currDeltaVersion, batchTimestamp, transaction);
       }
     }
   }
@@ -544,7 +550,9 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     ManageSnapshots manageSnapshots = transaction.manageSnapshots();
     manageSnapshots.createTag(DELTA_VERSION_TAG_PREFIX + deltaVersion, currentSnapshotId);
 
-    if (deltaVersionTimestamp != null) {
+    if (deltaVersionTimestamp != null && deltaTimestampTags.add(deltaVersionTimestamp)) {
+      // Avoid creating the same timestamp based tag multiple times for small and often writes to
+      // source delta table
       manageSnapshots.createTag(
           DELTA_TIMESTAMP_TAG_PREFIX + deltaVersionTimestamp, currentSnapshotId);
     }
