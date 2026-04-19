@@ -98,7 +98,7 @@ public class TestGCSInputStream {
 
   @Test
   public void testReadBufferedEOF() throws Exception {
-    BlobId uri = BlobId.fromGsUtilUri("gs://bucket/path/to/read_buffered_eof.dat");
+    BlobId uri = BlobId.fromGsUtilUri("gs://bucket/path/to/read.dat");
     int dataSize = 8;
     byte[] expected = randomData(dataSize);
     byte[] actual = new byte[dataSize + 1];
