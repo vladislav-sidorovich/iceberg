@@ -41,8 +41,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -78,6 +76,7 @@ import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.parquet.ParquetUtil;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -108,7 +107,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   private String newTableLocation;
   private HadoopFileIO deltaLakeFileIO;
   private DeletionVectorConverter deletionVectorConverter;
-  private OutputFileFactory icebergFileFactory;
+  private OutputFileFactory icebergDVFileFactory;
   private final Set<Long> deltaTimestampTags = Sets.newHashSet();
 
   BaseSnapshotDeltaLakeKernelTableAction(String deltaTableLocation) {
@@ -190,8 +189,10 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
             newTableLocation,
             buildTablePropertiesWithDelta(initialDeltaSnapshot, deltaTableLocation));
     setDefaultNamingMapping(transaction);
+    // Create an initial empty snapshot so currentSnapshot() is never null
+    transaction.newAppend().commit();
 
-    icebergFileFactory =
+    icebergDVFileFactory =
         OutputFileFactory.builderFor(transaction.table(), 1, 1).format(FileFormat.PUFFIN).build();
 
     Set<String> processedDataFiles = Sets.newHashSet();
@@ -253,7 +254,11 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   }
 
   private SnapshotImpl getDeltaSnapshotAsOfVersion(long deltaVersion) {
-    Snapshot snapshot = deltaTable.getSnapshotAsOfVersion(deltaEngine, deltaVersion);
+    Snapshot snapshot =
+        Preconditions.checkNotNull(
+            deltaTable.getSnapshotAsOfVersion(deltaEngine, deltaVersion),
+            "Delta snapshot for version %s is unreachable.",
+            deltaVersion);
     assertSnapshotImpl(snapshot);
     return (SnapshotImpl) snapshot;
   }
@@ -349,7 +354,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
       return List.of();
     }
 
-    DVFileWriter dvWriter = new BaseDVFileWriter(icebergFileFactory, path -> null);
+    DVFileWriter dvWriter = new BaseDVFileWriter(icebergDVFileFactory, path -> null);
     try (DVFileWriter closeableWriter = dvWriter) {
       long[] positions =
           deletionVectorConverter.readDeltaDVPositions(addFile.getDeletionVector().get());
@@ -429,6 +434,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
         transaction.table().properties().get(TableProperties.DEFAULT_NAME_MAPPING);
     NameMapping nameMapping =
         nameMappingString != null ? NameMappingParser.fromJson(nameMappingString) : null;
+    // TODO read metrics from Delta log to avoid data flies read
     Metrics metrics = ParquetUtil.fileMetrics(inputDataFile, metricsConfig, nameMapping);
 
     Map<String, String> partitionValues = VectorUtils.toJavaMap(addFile.getPartitionValues());
@@ -505,7 +511,10 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   private SnapshotImpl getLatestDeltaSnapshot() {
     Snapshot latestSnapshot;
     try {
-      latestSnapshot = deltaTable.getLatestSnapshot(deltaEngine);
+      latestSnapshot =
+          Preconditions.checkNotNull(
+              deltaTable.getLatestSnapshot(deltaEngine),
+              "The latest Delta table snapshot is unreachable.");
 
       assertSnapshotImpl(latestSnapshot);
 
@@ -542,9 +551,6 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
 
   private void tagCurrentSnapshot(
       long deltaVersion, Long deltaVersionTimestamp, Transaction transaction) {
-    if (transaction.table().currentSnapshot() == null) {
-      return; // Empty table doesn't have Iceberg snapshot yet
-    }
     long currentSnapshotId = transaction.table().currentSnapshot().snapshotId();
 
     ManageSnapshots manageSnapshots = transaction.manageSnapshots();
@@ -559,7 +565,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     manageSnapshots.commit();
   }
 
-  private static void assertSnapshotImpl(Snapshot latestSnapshot) {
+  private static void assertSnapshotImpl(@Nonnull Snapshot latestSnapshot) {
     if (!(latestSnapshot instanceof SnapshotImpl)) {
       throw new IllegalStateException(
           "Unsupported impl of delta Snapshot: " + latestSnapshot.getClass());
@@ -574,13 +580,16 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
         exception);
   }
 
-  private static String getFullFilePath(String path, String tableRoot) {
+  @VisibleForTesting
+  static String getFullFilePath(String path, String tableRoot) {
     URI dataFileUri = URI.create(path);
-    String decodedPath = URLDecoder.decode(path, StandardCharsets.UTF_8);
     if (dataFileUri.isAbsolute()) {
-      return decodedPath;
+      return dataFileUri.getScheme().equalsIgnoreCase("file") ? dataFileUri.getPath() : path;
     } else {
-      return tableRoot + File.separator + decodedPath;
+      String decodedPath = dataFileUri.getPath();
+      String separator =
+          tableRoot.contains(":/") ? "/" : File.separator; // Cloud Storages path vs File System
+      return tableRoot + (tableRoot.endsWith(separator) ? "" : separator) + decodedPath;
     }
   }
 }
