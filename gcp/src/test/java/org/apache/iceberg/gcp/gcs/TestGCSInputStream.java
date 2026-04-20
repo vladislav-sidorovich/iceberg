@@ -37,7 +37,7 @@ import org.apache.iceberg.metrics.MetricsContext;
 import org.junit.jupiter.api.Test;
 
 public class TestGCSInputStream {
-  private static final int EOF_FLAG = -1;
+  private static final int EOF = -1;
 
   private final Random random = new Random(1);
 
@@ -92,7 +92,7 @@ public class TestGCSInputStream {
         new GCSInputStream(storage, uri, null, gcpProperties, MetricsContext.nullMetrics())) {
       assertThat(in.read()).isEqualTo(i0);
       assertThat(in.read()).isEqualTo(i1);
-      assertThat(in.read()).isEqualTo(EOF_FLAG);
+      assertThat(in.read()).isEqualTo(EOF);
     }
   }
 
@@ -111,7 +111,7 @@ public class TestGCSInputStream {
       assertThat(bytesRead).isEqualTo(dataSize);
       assertThat(Arrays.copyOfRange(actual, 0, bytesRead)).isEqualTo(expected);
 
-      assertThat(in.read(actual, 0, 10)).isEqualTo(EOF_FLAG);
+      assertThat(in.read(actual, 0, 10)).isEqualTo(EOF);
       assertThat(in.getPos()).isEqualTo(dataSize);
     }
   }
