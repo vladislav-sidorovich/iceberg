@@ -119,7 +119,8 @@ public class TestADLSInputStream extends AzuriteTestBase {
       assertThat(bytesRead).isEqualTo(dataSize);
       assertThat(Arrays.copyOfRange(actual, 0, bytesRead)).isEqualTo(expected);
 
-      assertThat(in.read(actual, 0, 10)).isEqualTo(EOF);
+      // Pos is in the end of data, any read should EOF
+      assertThat(in.read(actual, 0, actual.length)).isEqualTo(EOF);
       assertThat(in.getPos()).isEqualTo(dataSize);
     }
   }
