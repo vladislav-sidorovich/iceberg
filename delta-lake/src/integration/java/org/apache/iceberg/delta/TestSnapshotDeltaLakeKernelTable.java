@@ -71,6 +71,8 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
           "false" // Spark will delete tables using v1, leaving the cache out of sync
           );
 
+  private static final int INITIAL_EMPTY_COMMIT = 1;
+
   private static Dataset<Row> genericDataFrame;
 
   @TempDir private File sourceLocation;
@@ -274,10 +276,11 @@ public class TestSnapshotDeltaLakeKernelTable extends SparkDeltaLakeSnapshotTest
     Map<String, SnapshotRef> icebergSnapshotRefs = icebergTable.refs();
     List<Snapshot> icebergSnapshots = Lists.newArrayList(icebergTable.snapshots());
 
-    assertThat(icebergSnapshots).hasSize((int) (currentVersion - firstConstructableVersion + 1));
+    assertThat(icebergSnapshots)
+        .hasSize((int) (currentVersion - firstConstructableVersion + 1) + INITIAL_EMPTY_COMMIT);
 
-    for (int i = 0; i < icebergSnapshots.size(); i++) {
-      long deltaVersion = firstConstructableVersion + i;
+    for (int i = 1; i < icebergSnapshots.size(); i++) {
+      long deltaVersion = firstConstructableVersion + i - INITIAL_EMPTY_COMMIT;
       Snapshot currentIcebergSnapshot = icebergSnapshots.get(i);
 
       String expectedVersionTag = "delta-version-" + deltaVersion;
