@@ -101,6 +101,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
   private final String deltaTableLocation;
   private Engine deltaEngine;
   private TableImpl deltaTable;
+  private SnapshotImpl deltaLatestSnapshot;
 
   private Catalog icebergCatalog;
   private TableIdentifier newTableIdentifier;
@@ -162,10 +163,12 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     Preconditions.checkArgument(
         deltaTable != null && deltaLakeFileIO != null,
         "Make sure to configure the action with a valid deltaLakeConfiguration");
+
+    loadLatestDeltaSnapshot();
     assertDeltaColumnMappingDisabled(
         "Conversion of Delta Lake tables with columnMapping feature is not supported.");
 
-    final long latestDeltaVersion = getLatestDeltaSnapshot().getVersion();
+    final long latestDeltaVersion = deltaLatestSnapshot.getVersion();
     final long minimalAvailableDeltaVersion = getEarliestRecreatableDeltaLog();
 
     SnapshotImpl initialDeltaSnapshot = getDeltaSnapshotAsOfVersion(minimalAvailableDeltaVersion);
@@ -236,7 +239,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
    * feature can lead to data corruption.
    */
   private void assertDeltaColumnMappingDisabled(String errorMessage) {
-    Map<String, String> configuration = getLatestDeltaSnapshot().getMetadata().getConfiguration();
+    Map<String, String> configuration = deltaLatestSnapshot.getMetadata().getConfiguration();
     String columnMappingMode = configuration.getOrDefault("delta.columnMapping.mode", "none");
     if (!"none".equals(columnMappingMode)) {
       throw new UnsupportedOperationException(errorMessage);
@@ -508,7 +511,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     }
   }
 
-  private SnapshotImpl getLatestDeltaSnapshot() {
+  private void loadLatestDeltaSnapshot() {
     Snapshot latestSnapshot;
     try {
       latestSnapshot =
@@ -518,7 +521,7 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
 
       assertSnapshotImpl(latestSnapshot);
 
-      return (SnapshotImpl) latestSnapshot;
+      this.deltaLatestSnapshot = (SnapshotImpl) latestSnapshot;
     } catch (TableNotFoundException e) {
       throw deltaTableNotFoundException(e);
     }
