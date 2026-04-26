@@ -41,10 +41,12 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import org.apache.hadoop.conf.Configuration;
@@ -79,6 +81,7 @@ import org.apache.iceberg.parquet.ParquetUtil;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterators;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
@@ -223,13 +226,38 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
       throws IOException {
     Scan scan = deltaSnapshot.getScanBuilder().build();
     try (CloseableIterator<FilteredColumnarBatch> changes = scan.getScanFiles(deltaEngine)) {
-      while (changes.hasNext()) {
-        FilteredColumnarBatch columnarBatch = changes.next();
-        commitDeltaColumnarBatchToIcebergTransaction(
-            columnarBatch.getData(), transaction, processedDataFiles);
-      }
+
+      commitDeltaColumnarBatchToIcebergTransaction(
+          Iterators.transform(changes, batch -> batch::getData), transaction, processedDataFiles);
       tagCurrentSnapshot(
           deltaSnapshot.getVersion(), deltaSnapshot.getTimestamp(deltaEngine), transaction);
+    }
+  }
+
+  private void convertEachDeltaVersion(
+      long initialDeltaVersion,
+      long latestDeltaVersion,
+      Transaction transaction,
+      Set<String> processedDataFiles)
+      throws IOException {
+
+    for (long currDeltaVersion = initialDeltaVersion;
+        currDeltaVersion <= latestDeltaVersion;
+        currDeltaVersion++) {
+      try (CloseableIterator<ColumnarBatch> changes =
+          deltaTable.getChanges(
+              deltaEngine,
+              currDeltaVersion,
+              currDeltaVersion,
+              Set.of(DeltaLogActionUtils.DeltaAction.values()))) {
+
+        Long commitTimestamp =
+            commitDeltaColumnarBatchToIcebergTransaction(
+                Iterators.transform(changes, batch -> () -> batch),
+                transaction,
+                processedDataFiles);
+        tagCurrentSnapshot(currDeltaVersion, commitTimestamp, transaction);
+      }
     }
   }
 
@@ -266,39 +294,6 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     return (SnapshotImpl) snapshot;
   }
 
-  private void convertEachDeltaVersion(
-      long initialDeltaVersion,
-      long latestDeltaVersion,
-      Transaction transaction,
-      Set<String> processedDataFiles)
-      throws IOException {
-
-    for (long currDeltaVersion = initialDeltaVersion;
-        currDeltaVersion <= latestDeltaVersion;
-        currDeltaVersion++) {
-      try (CloseableIterator<ColumnarBatch> changes =
-          deltaTable.getChanges(
-              deltaEngine,
-              currDeltaVersion,
-              currDeltaVersion,
-              Set.of(DeltaLogActionUtils.DeltaAction.values()))) {
-        Long batchTimestamp = null;
-        while (changes.hasNext()) {
-          ColumnarBatch columnarBatch = changes.next();
-
-          Long commitTimestamp =
-              commitDeltaColumnarBatchToIcebergTransaction(
-                  columnarBatch, transaction, processedDataFiles);
-          if (batchTimestamp == null) {
-            batchTimestamp = commitTimestamp;
-          }
-        }
-
-        tagCurrentSnapshot(currDeltaVersion, batchTimestamp, transaction);
-      }
-    }
-  }
-
   /**
    * Convert each delta log {@code ColumnarBatch} to Iceberg action and commit to the given {@code
    * Transaction}. The complete <a
@@ -310,7 +305,9 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
    * @return number of added data files
    */
   private Long commitDeltaColumnarBatchToIcebergTransaction(
-      ColumnarBatch columnarBatch, Transaction transaction, Set<String> processedDataFiles)
+      Iterator<Supplier<ColumnarBatch>> changes,
+      Transaction transaction,
+      Set<String> processedDataFiles)
       throws IOException {
 
     Long originalCommitTimestamp = null;
@@ -318,29 +315,34 @@ class BaseSnapshotDeltaLakeKernelTableAction implements SnapshotDeltaLakeTable {
     List<DataFile> dataFilesToRemove = Lists.newArrayList();
     List<DeleteFile> deleteFilesToAdd = Lists.newArrayList();
 
-    try (CloseableIterator<Row> rows = columnarBatch.getRows()) {
-      while (rows.hasNext()) {
-        Row row = rows.next();
-        if (DeltaLakeActionsTranslationUtil.isCommitInfo(row)) {
-          Row commitInfo = row.getStruct(row.getSchema().indexOf("commitInfo"));
-          originalCommitTimestamp = commitInfo.getLong(commitInfo.getSchema().indexOf("timestamp"));
-        } else if (DeltaLakeActionsTranslationUtil.isAdd(row)) {
-          AddFile addFile = DeltaLakeActionsTranslationUtil.toAdd(row);
+    while (changes.hasNext()) {
+      var container = changes.next();
+      ColumnarBatch columnarBatch = container.get();
+      try (CloseableIterator<Row> rows = columnarBatch.getRows()) {
+        while (rows.hasNext()) {
+          Row row = rows.next();
+          if (DeltaLakeActionsTranslationUtil.isCommitInfo(row)) {
+            Row commitInfo = row.getStruct(row.getSchema().indexOf("commitInfo"));
+            originalCommitTimestamp =
+                commitInfo.getLong(commitInfo.getSchema().indexOf("timestamp"));
+          } else if (DeltaLakeActionsTranslationUtil.isAdd(row)) {
+            AddFile addFile = DeltaLakeActionsTranslationUtil.toAdd(row);
 
-          DataFile dataFile = buildDataFileFromAddDeltaAction(addFile, transaction);
-          dataFilesToAdd.add(dataFile);
+            DataFile dataFile = buildDataFileFromAddDeltaAction(addFile, transaction);
+            dataFilesToAdd.add(dataFile);
 
-          List<DeleteFile> deleteFiles =
-              convertDeltaDVsToIcebergDVs(transaction.table().spec(), addFile, dataFile);
+            List<DeleteFile> deleteFiles =
+                convertDeltaDVsToIcebergDVs(transaction.table().spec(), addFile, dataFile);
 
-          deleteFilesToAdd.addAll(deleteFiles);
-          processedDataFiles.add(dataFile.location());
-        } else if (DeltaLakeActionsTranslationUtil.isRemove(row)) {
-          RemoveFile remove = DeltaLakeActionsTranslationUtil.toRemove(row);
+            deleteFilesToAdd.addAll(deleteFiles);
+            processedDataFiles.add(dataFile.location());
+          } else if (DeltaLakeActionsTranslationUtil.isRemove(row)) {
+            RemoveFile remove = DeltaLakeActionsTranslationUtil.toRemove(row);
 
-          DataFile dataFile = buildDataFileFromRemoveDeltaAction(remove, transaction);
-          dataFilesToRemove.add(dataFile);
-          processedDataFiles.add(dataFile.location());
+            DataFile dataFile = buildDataFileFromRemoveDeltaAction(remove, transaction);
+            dataFilesToRemove.add(dataFile);
+            processedDataFiles.add(dataFile.location());
+          }
         }
       }
     }
