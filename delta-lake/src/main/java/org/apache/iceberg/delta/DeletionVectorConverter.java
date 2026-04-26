@@ -24,11 +24,11 @@ import io.delta.kernel.internal.deletionvectors.DeletionVectorUtils;
 import io.delta.kernel.internal.deletionvectors.RoaringBitmapArray;
 import io.delta.kernel.internal.util.Tuple2;
 
-public class DeletionVectorConverter {
+class DeletionVectorConverter {
   private final Engine engine;
   private final String tablePath;
 
-  public DeletionVectorConverter(Engine engine, String tablePath) {
+  DeletionVectorConverter(Engine engine, String tablePath) {
     this.engine = engine;
     this.tablePath = tablePath;
   }
